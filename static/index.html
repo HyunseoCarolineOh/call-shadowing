@@ -1,0 +1,225 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<title>콜 섀도잉 툴</title>
+<style>
+  :root { --accent:#e5484d; --muted:#8b8d98; --line:#e0e1e6; --bg:#fdfdfe; }
+  * { box-sizing:border-box; }
+  body { font-family:'Segoe UI','Malgun Gothic',sans-serif; margin:0; background:var(--bg); color:#1c2024; }
+  header { display:flex; align-items:center; gap:16px; padding:14px 24px; border-bottom:1px solid var(--line); background:#fff; position:sticky; top:0; z-index:5; }
+  h1 { font-size:18px; margin:0; }
+  label { font-size:13px; color:var(--muted); }
+  select, input[type=text] { padding:6px 8px; border:1px solid var(--line); border-radius:6px; font-size:14px; }
+  main { max-width:1080px; margin:0 auto; padding:20px 24px 80px; }
+  .panel { background:#fff; border:1px solid var(--line); border-radius:10px; padding:14px 16px; margin-bottom:16px; }
+  .panel h2 { font-size:14px; margin:0 0 10px; color:var(--muted); font-weight:600; }
+  .row-flex { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
+  .tabs { display:flex; gap:6px; margin:18px 0 10px; }
+  .tab { padding:6px 14px; border-radius:20px; border:1px solid var(--line); background:#fff; cursor:pointer; font-size:13px; }
+  .tab.active { background:#1c2024; color:#fff; border-color:#1c2024; }
+  table { width:100%; border-collapse:collapse; background:#fff; border:1px solid var(--line); border-radius:10px; overflow:hidden; }
+  th, td { text-align:left; padding:10px 12px; border-bottom:1px solid var(--line); font-size:14px; vertical-align:top; }
+  th { background:#f6f7f9; font-size:12px; color:var(--muted); }
+  td .log-preview { color:var(--muted); font-size:12px; white-space:pre-line; max-height:54px; overflow:hidden; }
+  button { border:none; border-radius:6px; padding:7px 12px; font-size:13px; cursor:pointer; background:#eceef1; }
+  button:hover { filter:brightness(0.95); }
+  button.rec { background:var(--accent); color:#fff; }
+  button.rec.recording { animation:pulse 1.2s infinite; }
+  button.primary { background:#1c2024; color:#fff; }
+  @keyframes pulse { 50% { opacity:.55; } }
+  .badge { display:inline-block; font-size:11px; padding:2px 8px; border-radius:10px; background:#eceef1; }
+  #jobs { position:fixed; right:18px; bottom:18px; width:320px; display:flex; flex-direction:column; gap:8px; }
+  .job { background:#1c2024; color:#fff; padding:10px 14px; border-radius:10px; font-size:13px; box-shadow:0 4px 14px rgba(0,0,0,.25); }
+  .job .err { color:#ff9d9d; white-space:pre-line; }
+  a { color:#3358d4; text-decoration:none; font-size:13px; }
+  .empty { padding:30px; text-align:center; color:var(--muted); }
+</style>
+</head>
+<body>
+<header>
+  <h1>📞 콜 섀도잉 툴</h1>
+  <label>Caller
+    <select id="caller"></select>
+  </label>
+  <label>녹음 유형
+    <select id="kind">
+      <option value="call" selected>📞 고객 콜</option>
+      <option value="meeting">📝 팀 회의</option>
+    </select>
+  </label>
+  <span style="flex:1"></span>
+  <button onclick="loadCalls()">새로고침</button>
+</header>
+
+<main>
+  <div class="panel">
+    <h2>시트 업로드 → 투두 생성</h2>
+    <div class="row-flex">
+      <input type="file" id="sheetFile" accept=".csv,.xlsx">
+      <input type="text" id="sheetCampaign" placeholder="캠페인명 (예: 교육박람회)">
+      <label><input type="checkbox" id="onlyMine" checked> 내(Owner=<span id="ownerName"></span>) 행만</label>
+      <button class="primary" onclick="importSheet()">업로드</button>
+      <span id="importResult" style="font-size:13px;color:var(--muted)"></span>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h2>새 콜 직접 추가</h2>
+    <div class="row-flex">
+      <input type="text" id="newAccount" placeholder="계정명">
+      <input type="text" id="newCampaign" placeholder="캠페인 (선택)">
+      <button class="primary" onclick="createCall()">추가</button>
+    </div>
+  </div>
+
+  <div class="tabs" id="tabs"></div>
+  <div id="list"></div>
+</main>
+
+<div id="jobs"></div>
+
+<script>
+const STATUSES = ['Todo','Nextaction','Nopickup','Done'];
+let calls = [], activeTab = 'Todo';
+let recorder = null, recChunks = [], recPageId = null, recAccount = null;
+
+async function api(path, opts) {
+  const r = await fetch(path, opts);
+  if (!r.ok) { const t = await r.json().catch(()=>({detail:r.statusText})); throw new Error(t.detail || r.statusText); }
+  return r.json();
+}
+
+async function init() {
+  const meta = await api('/api/meta');
+  const sel = document.getElementById('caller');
+  meta.callers.forEach(c => sel.add(new Option(c, c)));
+  sel.value = meta.default_caller;
+  document.getElementById('ownerName').textContent = meta.default_caller;
+  renderTabs();
+  loadCalls();
+  setInterval(pollJobs, 3000);
+}
+
+function renderTabs() {
+  const el = document.getElementById('tabs');
+  el.innerHTML = '';
+  STATUSES.forEach(s => {
+    const count = calls.filter(c => c.status === s).length;
+    const b = document.createElement('button');
+    b.className = 'tab' + (s === activeTab ? ' active' : '');
+    b.textContent = `${s} (${count})`;
+    b.onclick = () => { activeTab = s; renderTabs(); renderList(); };
+    el.appendChild(b);
+  });
+}
+
+async function loadCalls() {
+  try { calls = await api('/api/calls'); } catch (e) { alert(e.message); return; }
+  renderTabs(); renderList();
+}
+
+function renderList() {
+  const rows = calls.filter(c => c.status === activeTab);
+  const el = document.getElementById('list');
+  if (!rows.length) { el.innerHTML = '<div class="empty">이 상태의 콜이 없어요.</div>'; return; }
+  el.innerHTML = `<table><tr><th>Account</th><th>Campaign</th><th>Date</th><th>Call Log</th><th style="width:230px">액션</th></tr>` +
+    rows.map(c => `<tr>
+      <td><b>${esc(c.account)}</b><br><span class="badge">${esc(c.caller || '-')}</span></td>
+      <td>${esc(c.campaign)}</td>
+      <td>${esc(c.date)}</td>
+      <td><div class="log-preview">${esc(c.call_log)}</div></td>
+      <td>
+        <button class="rec" id="rec-${c.id}" onclick="toggleRecord('${c.id}', '${esc(c.account)}')">🔴 녹음</button>
+        <button onclick="markNopickup('${c.id}')">📵 Nopickup</button>
+        <a href="${c.url}" target="_blank">노션 열기</a>
+      </td>
+    </tr>`).join('') + '</table>';
+}
+
+function esc(s) { return String(s ?? '').replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m])); }
+
+async function toggleRecord(pageId, account) {
+  const btn = document.getElementById('rec-' + pageId);
+  if (recorder && recPageId === pageId) { recorder.stop(); return; }
+  if (recorder) { alert('다른 콜을 녹음 중이에요. 먼저 정지해주세요.'); return; }
+  let stream;
+  try { stream = await navigator.mediaDevices.getUserMedia({ audio: true }); }
+  catch { alert('마이크 권한이 필요해요.'); return; }
+  recChunks = []; recPageId = pageId; recAccount = account;
+  recorder = new MediaRecorder(stream, { mimeType: 'audio/webm' });
+  recorder.ondataavailable = e => recChunks.push(e.data);
+  recorder.onstop = async () => {
+    stream.getTracks().forEach(t => t.stop());
+    const blob = new Blob(recChunks, { type: 'audio/webm' });
+    recorder = null;
+    btn.classList.remove('recording'); btn.textContent = '🔴 녹음';
+    const fd = new FormData();
+    fd.append('file', blob, 'call.webm');
+    fd.append('account', recAccount);
+    fd.append('caller', document.getElementById('caller').value);
+    fd.append('kind', document.getElementById('kind').value);
+    try { await api(`/api/calls/${recPageId}/audio`, { method: 'POST', body: fd }); }
+    catch (e) { alert('업로드 실패: ' + e.message); }
+    pollJobs();
+  };
+  recorder.start();
+  btn.classList.add('recording'); btn.textContent = '⏹ 정지';
+}
+
+async function markNopickup(pageId) {
+  const fd = new FormData();
+  fd.append('caller', document.getElementById('caller').value);
+  try { await api(`/api/calls/${pageId}/nopickup`, { method: 'POST', body: fd }); loadCalls(); }
+  catch (e) { alert(e.message); }
+}
+
+async function createCall() {
+  const fd = new FormData();
+  fd.append('account', document.getElementById('newAccount').value);
+  fd.append('campaign', document.getElementById('newCampaign').value);
+  try { await api('/api/calls', { method: 'POST', body: fd });
+    document.getElementById('newAccount').value = ''; loadCalls(); }
+  catch (e) { alert(e.message); }
+}
+
+async function importSheet() {
+  const f = document.getElementById('sheetFile').files[0];
+  const campaign = document.getElementById('sheetCampaign').value.trim();
+  if (!f) { alert('파일을 선택해주세요.'); return; }
+  if (!campaign) { alert('캠페인명을 입력해주세요.'); return; }
+  const fd = new FormData();
+  fd.append('file', f);
+  fd.append('campaign', campaign);
+  fd.append('only_mine', document.getElementById('onlyMine').checked);
+  const out = document.getElementById('importResult');
+  out.textContent = '업로드 중...';
+  try {
+    const r = await api('/api/import', { method: 'POST', body: fd });
+    out.textContent = `생성 ${r.created.length}건 / 중복 스킵 ${r.skipped_dup.length}건 / Owner 필터 제외 ${r.skipped_owner}건`;
+    loadCalls();
+  } catch (e) { out.textContent = '실패: ' + e.message; }
+}
+
+let lastJobsDone = {};
+async function pollJobs() {
+  let jobs;
+  try { jobs = await api('/api/jobs'); } catch { return; }
+  const el = document.getElementById('jobs');
+  el.innerHTML = '';
+  let refreshNeeded = false;
+  Object.entries(jobs).reverse().slice(0, 5).forEach(([id, j]) => {
+    if (j.done && !j.error && !lastJobsDone[id]) { lastJobsDone[id] = true; refreshNeeded = true; }
+    if (j.done && !j.error && Date.now()/1000 - j.updated > 60) return; // 완료 1분 후 숨김
+    const d = document.createElement('div');
+    d.className = 'job';
+    d.innerHTML = `<b>${esc(j.account)}</b> — ${esc(j.stage)}` + (j.error ? `<div class="err">${esc(j.error)}</div>` : '');
+    el.appendChild(d);
+  });
+  if (refreshNeeded) loadCalls();
+}
+
+init();
+</script>
+</body>
+</html>
